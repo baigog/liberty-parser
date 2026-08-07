@@ -1,0 +1,289 @@
+/*
+ * Fixture for intra-library cell comparison.
+ *
+ * A realistic buffer family: same logic function, different drive strength and
+ * different Vt flavour, with DIFFERENT index_2 (output load) grids -- which is
+ * exactly why comparing them needs interpolation onto a common operating point
+ * rather than elementwise LUT diffing.
+ *
+ * Planted so the "which one should I avoid" answer is knowable by hand:
+ *   BUFx1      baseline
+ *   BUFx2      2x drive: bigger, leakier, lower drive resistance
+ *   BUFx4_LVT  fast but 9x the leakage of BUFx1 -- the trap cell
+ *   BUFx1_HVT  same area and drive as BUFx1, 1/3 the leakage, slower
+ *   BUFx2_ECO  marked dont_use by the vendor
+ *   CLKBUFx2   same function, but a clock buffer -- not interchangeable
+ */
+library (sample_buffers_tt_0p70v_25c) {
+  delay_model : table_lookup;
+  time_unit : "1ns";
+  voltage_unit : "1V";
+  capacitive_load_unit (1, pf);
+  leakage_power_unit : "1nW";
+  nom_process : 1.0;
+  nom_temperature : 25.0;
+  nom_voltage : 0.70;
+
+  lu_table_template (del_1x3) {
+    variable_1 : input_net_transition;
+    variable_2 : total_output_net_capacitance;
+    index_1 ("0.010, 0.040, 0.160");
+    index_2 ("0.001, 0.004, 0.016");
+  }
+  lu_table_template (del_2x3) {
+    variable_1 : input_net_transition;
+    variable_2 : total_output_net_capacitance;
+    index_1 ("0.010, 0.040, 0.160");
+    index_2 ("0.002, 0.008, 0.032");
+  }
+
+  cell (BUFx1) {
+    area : 0.240;
+    cell_leakage_power : 9.0;
+    pin (A) {
+      direction : input;
+      capacitance : 0.00100;
+    }
+    pin (Y) {
+      direction : output;
+      function : "A";
+      max_capacitance : 0.032;
+      timing () {
+        related_pin : "A";
+        timing_sense : positive_unate;
+        timing_type : combinational;
+        /* delay = 0.020 + 4.0 * load  -> intrinsic 0.020, drive R 4.0 */
+        cell_rise (del_1x3) {
+          index_1 ("0.010, 0.040, 0.160");
+          index_2 ("0.001, 0.004, 0.016");
+          values ("0.0240, 0.0360, 0.0840", \
+                  "0.0240, 0.0360, 0.0840", \
+                  "0.0240, 0.0360, 0.0840");
+        }
+        cell_fall (del_1x3) {
+          index_1 ("0.010, 0.040, 0.160");
+          index_2 ("0.001, 0.004, 0.016");
+          values ("0.0220, 0.0340, 0.0820", \
+                  "0.0220, 0.0340, 0.0820", \
+                  "0.0220, 0.0340, 0.0820");
+        }
+        rise_transition (del_1x3) {
+          index_1 ("0.010, 0.040, 0.160");
+          index_2 ("0.001, 0.004, 0.016");
+          values ("0.0120, 0.0240, 0.0720", \
+                  "0.0120, 0.0240, 0.0720", \
+                  "0.0120, 0.0240, 0.0720");
+        }
+      }
+    }
+  }
+
+  cell (BUFx2) {
+    area : 0.420;
+    cell_leakage_power : 19.0;
+    pin (A) {
+      direction : input;
+      capacitance : 0.00200;
+    }
+    pin (Y) {
+      direction : output;
+      function : "A";
+      max_capacitance : 0.064;
+      timing () {
+        related_pin : "A";
+        timing_sense : positive_unate;
+        timing_type : combinational;
+        /* delay = 0.022 + 2.0 * load  -> half the drive resistance of BUFx1 */
+        cell_rise (del_2x3) {
+          index_1 ("0.010, 0.040, 0.160");
+          index_2 ("0.002, 0.008, 0.032");
+          values ("0.0260, 0.0380, 0.0860", \
+                  "0.0260, 0.0380, 0.0860", \
+                  "0.0260, 0.0380, 0.0860");
+        }
+        cell_fall (del_2x3) {
+          index_1 ("0.010, 0.040, 0.160");
+          index_2 ("0.002, 0.008, 0.032");
+          values ("0.0240, 0.0360, 0.0840", \
+                  "0.0240, 0.0360, 0.0840", \
+                  "0.0240, 0.0360, 0.0840");
+        }
+      }
+    }
+  }
+
+  cell (BUFx4_LVT) {
+    area : 0.420;
+    cell_leakage_power : 81.0;
+    pin (A) {
+      direction : input;
+      capacitance : 0.00200;
+    }
+    pin (Y) {
+      direction : output;
+      function : "A";
+      max_capacitance : 0.064;
+      timing () {
+        related_pin : "A";
+        timing_sense : positive_unate;
+        timing_type : combinational;
+        /* delay = 0.011 + 1.0 * load -- fastest, but nine times the leakage */
+        cell_rise (del_2x3) {
+          index_1 ("0.010, 0.040, 0.160");
+          index_2 ("0.002, 0.008, 0.032");
+          values ("0.0130, 0.0190, 0.0430", \
+                  "0.0130, 0.0190, 0.0430", \
+                  "0.0130, 0.0190, 0.0430");
+        }
+        cell_fall (del_2x3) {
+          index_1 ("0.010, 0.040, 0.160");
+          index_2 ("0.002, 0.008, 0.032");
+          values ("0.0120, 0.0180, 0.0420", \
+                  "0.0120, 0.0180, 0.0420", \
+                  "0.0120, 0.0180, 0.0420");
+        }
+      }
+    }
+  }
+
+  cell (BUFx1_HVT) {
+    area : 0.240;
+    cell_leakage_power : 3.0;
+    pin (A) {
+      direction : input;
+      capacitance : 0.00100;
+    }
+    pin (Y) {
+      direction : output;
+      function : "A";
+      max_capacitance : 0.032;
+      timing () {
+        related_pin : "A";
+        timing_sense : positive_unate;
+        timing_type : combinational;
+        /* delay = 0.030 + 6.0 * load -- slow, but a third of the leakage */
+        cell_rise (del_1x3) {
+          index_1 ("0.010, 0.040, 0.160");
+          index_2 ("0.001, 0.004, 0.016");
+          values ("0.0360, 0.0540, 0.1260", \
+                  "0.0360, 0.0540, 0.1260", \
+                  "0.0360, 0.0540, 0.1260");
+        }
+        cell_fall (del_1x3) {
+          index_1 ("0.010, 0.040, 0.160");
+          index_2 ("0.001, 0.004, 0.016");
+          values ("0.0340, 0.0520, 0.1240", \
+                  "0.0340, 0.0520, 0.1240", \
+                  "0.0340, 0.0520, 0.1240");
+        }
+      }
+    }
+  }
+
+  /* Strictly worse than BUFx1 on every axis at identical function, same input
+     capacitance and same max_capacitance: the one cell here that really is
+     redundant. */
+  cell (BUFx1_OLD) {
+    area : 0.260;
+    cell_leakage_power : 11.0;
+    pin (A) {
+      direction : input;
+      capacitance : 0.00100;
+    }
+    pin (Y) {
+      direction : output;
+      function : "A";
+      max_capacitance : 0.032;
+      timing () {
+        related_pin : "A";
+        timing_sense : positive_unate;
+        timing_type : combinational;
+        /* delay = 0.024 + 5.0 * load -- slower AND weaker than BUFx1 */
+        cell_rise (del_1x3) {
+          index_1 ("0.010, 0.040, 0.160");
+          index_2 ("0.001, 0.004, 0.016");
+          values ("0.0290, 0.0440, 0.1040", \
+                  "0.0290, 0.0440, 0.1040", \
+                  "0.0290, 0.0440, 0.1040");
+        }
+        cell_fall (del_1x3) {
+          index_1 ("0.010, 0.040, 0.160");
+          index_2 ("0.001, 0.004, 0.016");
+          values ("0.0270, 0.0420, 0.1020", \
+                  "0.0270, 0.0420, 0.1020", \
+                  "0.0270, 0.0420, 0.1020");
+        }
+      }
+    }
+  }
+
+  cell (BUFx2_ECO) {
+    area : 0.420;
+    cell_leakage_power : 19.0;
+    dont_use : true;
+    dont_touch : true;
+    pin (A) {
+      direction : input;
+      capacitance : 0.00200;
+    }
+    pin (Y) {
+      direction : output;
+      function : "A";
+      max_capacitance : 0.064;
+      timing () {
+        related_pin : "A";
+        timing_sense : positive_unate;
+        timing_type : combinational;
+        cell_rise (del_2x3) {
+          index_1 ("0.010, 0.040, 0.160");
+          index_2 ("0.002, 0.008, 0.032");
+          values ("0.0260, 0.0380, 0.0860", \
+                  "0.0260, 0.0380, 0.0860", \
+                  "0.0260, 0.0380, 0.0860");
+        }
+        cell_fall (del_2x3) {
+          index_1 ("0.010, 0.040, 0.160");
+          index_2 ("0.002, 0.008, 0.032");
+          values ("0.0240, 0.0360, 0.0840", \
+                  "0.0240, 0.0360, 0.0840", \
+                  "0.0240, 0.0360, 0.0840");
+        }
+      }
+    }
+  }
+
+  cell (CLKBUFx2) {
+    area : 0.480;
+    cell_leakage_power : 21.0;
+    clock_cell : true;
+    pin (A) {
+      direction : input;
+      capacitance : 0.00220;
+      clock : true;
+    }
+    pin (Y) {
+      direction : output;
+      function : "A";
+      max_capacitance : 0.064;
+      timing () {
+        related_pin : "A";
+        timing_sense : positive_unate;
+        timing_type : combinational;
+        cell_rise (del_2x3) {
+          index_1 ("0.010, 0.040, 0.160");
+          index_2 ("0.002, 0.008, 0.032");
+          values ("0.0250, 0.0370, 0.0850", \
+                  "0.0250, 0.0370, 0.0850", \
+                  "0.0250, 0.0370, 0.0850");
+        }
+        cell_fall (del_2x3) {
+          index_1 ("0.010, 0.040, 0.160");
+          index_2 ("0.002, 0.008, 0.032");
+          values ("0.0230, 0.0350, 0.0830", \
+                  "0.0230, 0.0350, 0.0830", \
+                  "0.0230, 0.0350, 0.0830");
+        }
+      }
+    }
+  }
+}

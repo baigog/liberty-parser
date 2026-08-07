@@ -83,65 +83,43 @@ class LibertySyntaxError(Exception):
 # The `word` branch accepts a backslash only when it is NOT a line continuation,
 # so `values( \` splits correctly while an escaped identifier like `\A1` stays
 # one token.
+#
+# Two things here are about speed, not grammar:
+#   * the leading [ \t\f\v]* absorbs indentation into whichever token follows,
+#     so runs of spaces never produce a match of their own -- about a third of
+#     all matches in a real library are indentation.
+#   * the `bad` catch-all means every character matches something, which lets
+#     the lexer use finditer (loop driven in C) instead of a match() call per
+#     token from Python, without losing detection of invalid input. It excludes
+#     whitespace so that trailing blanks at EOF are not reported as garbage.
 _TOKEN_RE = re.compile(r"""
-      (?P<comment> /\*.*?\*/ | //[^\n]* )
-    | (?P<cont>    \\[ \t]*\r?\n )
-    | (?P<string>  "(?:[^"\\]|\\.)*" )
-    | (?P<newline> \r?\n )
-    | (?P<space>   [ \t\f\v]+ )
-    | (?P<punct>   [:;(){},] )
-    | (?P<word>    (?:[^\s:;(){},"\\]|\\(?!\r?\n))+ )
+      [ \t\f\v]*
+      (?: (?P<comment> /\*.*?\*/ | //[^\n]* )
+        | (?P<cont>    \\[ \t]*\r?\n )
+        | (?P<string>  "(?:[^"\\]|\\.)*" )
+        | (?P<newline> \r?\n )
+        | (?P<punct>   [:;(){},] )
+        | (?P<word>    (?:[^\s:;(){},"\\]|\\(?!\r?\n))+ )
+        | (?P<bad>     [^\s] ) )
 """, re.DOTALL | re.VERBOSE)
 
+# lastindex is an int we need anyway to pull the group out from under the folded
+# whitespace, so the name comes from a list rather than a second dict lookup.
+_KINDS = [None] * (_TOKEN_RE.groups + 1)  # type: List[Optional[str]]
+for _name, _idx in _TOKEN_RE.groupindex.items():
+    _KINDS[_idx] = _name
+
 _EOF = 'eof'
-_DROPPED = frozenset(['comment', 'cont', 'space'])
+_EOF_TOKEN = (_EOF, '')
 
-# Only these can contain a newline, so the line counter skips the scan on the
-# words and punctuation that make up most of the stream.
-_MAY_SPAN_LINES = frozenset(['comment', 'cont', 'newline', 'string'])
-
-Token = Tuple[str, str, int, int]  # kind, value, line, col
-
-
-def tokenize(text, filename=None):
-    # type: (str, Optional[str]) -> Iterator[Token]
-    """Yield (kind, value, line, col) tokens. Comments/continuations are dropped.
-
-    Quoted strings are yielded with their quotes stripped and escapes resolved.
-    """
-    pos = 0
-    end = len(text)
-    line = 1
-    line_start = 0
-    match = _TOKEN_RE.match
-    while pos < end:
-        m = match(text, pos)
-        if m is None:
-            # Only reachable via an unterminated quote or a stray backslash at EOF.
-            raise LibertySyntaxError(
-                'unexpected character %r (unterminated string?)' % text[pos],
-                filename, line, pos - line_start + 1)
-        kind = m.lastgroup
-        value = m.group()
-        start = pos
-        pos = m.end()
-
-        newlines = value.count('\n') if kind in _MAY_SPAN_LINES else 0
-        if kind not in _DROPPED:
-            col = start - line_start + 1
-            if kind == 'string':
-                yield ('string', _unescape(value[1:-1]), line, col)
-            elif kind != 'newline':
-                yield (kind, value, line, col)
-            else:
-                yield ('newline', '\n', line, col)
-        if newlines:
-            line += newlines
-            line_start = start + value.rfind('\n') + 1
-    yield (_EOF, '', line, pos - line_start + 1)
-
+# Characters that can change brace depth or open a region where a brace is not a
+# brace. Everything else is irrelevant when skipping a group body wholesale.
+_SKIP_RE = re.compile(r'["{}]|/\*|//')
+_STRING_TAIL_RE = re.compile(r'(?:[^"\\]|\\.)*"', re.DOTALL)
 
 _ESCAPE_RE = re.compile(r'\\(.)')
+
+Token = Tuple[str, str]  # kind, value
 
 
 def _unescape(s):
@@ -149,42 +127,144 @@ def _unescape(s):
     return _ESCAPE_RE.sub(r'\1', s) if '\\' in s else s
 
 
-class _Stream(object):
-    """One-token-lookahead view over the token generator.
+def locate(text, offset):
+    # type: (str, int) -> Tuple[int, int]
+    """Byte offset -> (line, column), both 1-based.
 
-    A generator rather than a list: a 300 MB library is ~30M tokens, and holding
-    them all as tuples costs more than the tree itself.
+    Computed on demand instead of tracked per token: only errors need it, and
+    counting newlines once at failure time is free compared with doing it on
+    every one of tens of millions of tokens.
+    """
+    line = text.count('\n', 0, offset) + 1
+    col = offset - (text.rfind('\n', 0, offset) + 1) + 1
+    return line, col
+
+
+def tokenize(text, filename=None):
+    # type: (str, Optional[str]) -> Iterator[Tuple[str, str, int]]
+    """Yield (kind, value, offset). Comments and continuations are dropped.
+
+    Quoted strings arrive with their quotes stripped and escapes resolved. Use
+    `locate()` to turn an offset into a line and column.
+    """
+    lexer = _Lexer(text, filename)
+    while True:
+        kind, value = lexer.peek()
+        if kind == _EOF:
+            return
+        yield (kind, value, lexer.offset)
+        lexer.next()
+
+
+class _Lexer(object):
+    """One-token-lookahead scanner that can also jump over a region of source.
+
+    Backed by a finditer rather than a generator of tuples: the loop runs in C,
+    and the iterator can be re-seated at an arbitrary offset, which is what makes
+    skip_groups able to leap over a group body without tokenizing it.
     """
 
-    __slots__ = ('_it', '_buf', '_last')
+    __slots__ = ('text', 'filename', '_it', '_tok', '_m', '_cur')
 
-    def __init__(self, it):
-        # type: (Iterator[Token]) -> None
-        self._it = it
-        self._buf = None  # type: Optional[Token]
-        self._last = (_EOF, '', 0, 0)  # type: Token
+    def __init__(self, text, filename=None, pos=0):
+        # type: (str, Optional[str], int) -> None
+        self.text = text
+        self.filename = filename
+        self._it = _TOKEN_RE.finditer(text, pos)
+        self._tok = None  # type: Optional[Token]
+        self._m = None    # match backing the peeked token
+        self._cur = None  # match backing the last consumed token
 
     def peek(self):
         # type: () -> Token
-        if self._buf is None:
-            try:
-                self._buf = next(self._it)
-            except StopIteration:
-                self._buf = self._last
-        return self._buf
+        tok = self._tok
+        if tok is not None:
+            return tok
+        for m in self._it:
+            idx = m.lastindex
+            kind = _KINDS[idx]
+            if kind == 'comment' or kind == 'cont':
+                continue
+            value = m.group(idx)
+            if kind == 'string':
+                value = _unescape(value[1:-1])
+            elif kind == 'bad':
+                line, col = locate(self.text, m.start(idx))
+                raise LibertySyntaxError(
+                    'unexpected character %r (unterminated string?)' % value,
+                    self.filename, line, col)
+            self._tok = (kind, value)
+            self._m = m
+            return self._tok
+        self._tok = _EOF_TOKEN
+        self._m = None
+        return _EOF_TOKEN
 
     def next(self):
         # type: () -> Token
         tok = self.peek()
         if tok[0] != _EOF:
-            self._buf = None
-        self._last = tok
+            self._cur = self._m
+            self._tok = None
         return tok
 
     def skip_newlines(self):
         # type: () -> None
         while self.peek()[0] == 'newline':
             self.next()
+
+    @property
+    def offset(self):
+        # type: () -> int
+        """Offset of the token itself, past the whitespace folded into the match.
+
+        Read only on errors and by tokenize(), so resolving the group index here
+        costs nothing on the hot path.
+        """
+        m = self._m if self._m is not None else self._cur
+        return m.start(m.lastindex) if m is not None else len(self.text)
+
+    def skip_body(self):
+        # type: () -> None
+        """Jump past the group body whose '{' was just consumed.
+
+        Scans the raw source for the matching brace instead of tokenizing what
+        it is about to throw away. On a CCS-heavy library, where the current
+        vectors are most of the file, this is the difference between reading the
+        bulk of the file and stepping over it.
+        """
+        text = self.text
+        pos = self._cur.end()
+        depth = 1
+        search = _SKIP_RE.search
+        while depth:
+            m = search(text, pos)
+            if m is None:
+                line, col = locate(text, len(text))
+                raise LibertySyntaxError('unexpected end of file in skipped group',
+                                         self.filename, line, col)
+            found = m.group()
+            pos = m.end()
+            if found == '{':
+                depth += 1
+            elif found == '}':
+                depth -= 1
+            elif found == '"':
+                tail = _STRING_TAIL_RE.match(text, pos)
+                if tail is None:
+                    line, col = locate(text, m.start())
+                    raise LibertySyntaxError('unterminated string',
+                                             self.filename, line, col)
+                pos = tail.end()
+            elif found == '/*':
+                close = text.find('*/', pos)
+                pos = len(text) if close < 0 else close + 2
+            else:  # //
+                nl = text.find('\n', pos)
+                pos = len(text) if nl < 0 else nl + 1
+        self._it = _TOKEN_RE.finditer(text, pos)
+        self._tok = None
+        self._m = None
 
 
 # --------------------------------------------------------------------------
@@ -348,14 +428,15 @@ class _Parser(object):
     __slots__ = ('stream', 'filename', 'skip_groups')
 
     def __init__(self, stream, filename, skip_groups):
-        # type: (_Stream, Optional[str], frozenset) -> None
+        # type: (_Lexer, Optional[str], frozenset) -> None
         self.stream = stream
         self.filename = filename
         self.skip_groups = skip_groups
 
-    def error(self, message, tok, group=None):
-        # type: (str, Token, Optional[Group]) -> LibertySyntaxError
-        return LibertySyntaxError(message, self.filename, tok[2], tok[3],
+    def error(self, message, group=None):
+        # type: (str, Optional[Group]) -> LibertySyntaxError
+        line, col = locate(self.stream.text, self.stream.offset)
+        return LibertySyntaxError(message, self.filename, line, col,
                                   group.path if group is not None else '')
 
     def parse_top(self):
@@ -374,12 +455,12 @@ class _Parser(object):
         # type: (Group, bool) -> None
         stream = self.stream
         while True:
-            kind, value, _, _ = tok = stream.peek()
+            kind, value = stream.peek()
 
             if kind == _EOF:
                 if top_level:
                     return
-                raise self.error('unexpected end of file, unclosed group', tok, group)
+                raise self.error('unexpected end of file, unclosed group', group)
 
             if kind == 'newline':
                 stream.next()
@@ -388,25 +469,25 @@ class _Parser(object):
             if kind == 'punct':
                 if value == '}':
                     if top_level:
-                        raise self.error("unmatched '}'", tok, group)
+                        raise self.error("unmatched '}'", group)
                     stream.next()
                     self._eat_optional_semicolon()
                     return
                 if value == ';':  # stray separator, harmless
                     stream.next()
                     continue
-                raise self.error('unexpected %r' % value, tok, group)
+                raise self.error('unexpected %r' % value, group)
 
-            if kind not in ('word', 'string'):
-                raise self.error('unexpected token %r' % value, tok, group)
+            if kind != 'word' and kind != 'string':
+                raise self.error('unexpected token %r' % value, group)
 
             stream.next()
-            self._parse_statement(group, value, tok)
+            self._parse_statement(group, value)
 
-    def _parse_statement(self, group, name, name_tok):
-        # type: (Group, str, Token) -> None
+    def _parse_statement(self, group, name):
+        # type: (Group, str) -> None
         stream = self.stream
-        kind, value, _, _ = tok = stream.peek()
+        kind, value = stream.peek()
 
         if kind == 'punct' and value == ':':
             stream.next()
@@ -428,36 +509,18 @@ class _Parser(object):
                 self._eat_optional_semicolon()
             return
 
-        raise self.error("expected ':' or '(' after %r" % name, tok, group)
+        raise self.error("expected ':' or '(' after %r" % name, group)
 
     def _parse_group(self, parent, type_, args):
         # type: (Group, str, List[str]) -> None
         if type_ in self.skip_groups:
-            self._skip_braced_body(parent)
+            # Leap over the body in the raw source rather than tokenizing it.
+            self.stream.skip_body()
+            self._eat_optional_semicolon()
             return
         child = Group(type_, args, parent)
         parent.groups.append(child)
         self.parse_body(child)
-
-    def _skip_braced_body(self, group):
-        # type: (Group) -> None
-        """Discard a group body by brace counting. The opening '{' is consumed.
-
-        Strings and comments are already tokenized, so braces inside them cannot
-        confuse the depth count.
-        """
-        stream = self.stream
-        depth = 1
-        while depth:
-            kind, value, _, _ = tok = stream.next()
-            if kind == _EOF:
-                raise self.error('unexpected end of file in skipped group', tok, group)
-            if kind == 'punct':
-                if value == '{':
-                    depth += 1
-                elif value == '}':
-                    depth -= 1
-        self._eat_optional_semicolon()
 
     def _parse_simple_value(self, group):
         # type: (Group) -> str
@@ -469,7 +532,7 @@ class _Parser(object):
         stream = self.stream
         parts = []  # type: List[str]
         while True:
-            kind, value, _, _ = stream.peek()
+            kind, value = stream.peek()
             if kind == _EOF:
                 break
             if kind == 'newline':
@@ -487,7 +550,7 @@ class _Parser(object):
             stream.next()
             parts.append(value)
         if not parts:
-            raise self.error('empty attribute value', stream.peek(), group)
+            raise self.error('empty attribute value', group)
         return parts[0] if len(parts) == 1 else ' '.join(parts)
 
     def _parse_args(self, group):
@@ -497,9 +560,9 @@ class _Parser(object):
         args = []  # type: List[str]
         parts = []  # type: List[str]
         while True:
-            kind, value, _, _ = tok = stream.next()
+            kind, value = stream.next()
             if kind == _EOF:
-                raise self.error('unexpected end of file inside (...)', tok, group)
+                raise self.error('unexpected end of file inside (...)', group)
             if kind == 'newline':
                 continue
             if kind == 'punct':
@@ -521,7 +584,7 @@ class _Parser(object):
         # type: () -> None
         stream = self.stream
         while True:
-            kind, value, _, _ = stream.peek()
+            kind, value = stream.peek()
             if kind == 'newline' or (kind == 'punct' and value == ';'):
                 stream.next()
                 if kind == 'punct':
@@ -537,8 +600,7 @@ class _Parser(object):
 def parse_string(text, filename=None, skip_groups=frozenset()):
     # type: (str, Optional[str], Sequence[str]) -> Group
     """Parse Liberty source text into a Group tree."""
-    parser = _Parser(_Stream(tokenize(text, filename)), filename,
-                     frozenset(skip_groups))
+    parser = _Parser(_Lexer(text, filename), filename, frozenset(skip_groups))
     return parser.parse_top()
 
 
@@ -551,10 +613,12 @@ def parse_file(path, skip_groups=frozenset(), encoding='utf-8'):
         makes up the bulk of an advanced-node library.
     """
     # ponytail: whole file is read into memory, then regex-tokenized at roughly
-    # 3.5 MB/s (measured: 14 MB in ~4 s), so a 200 MB library takes about a
-    # minute. Tokenizing is ~2/3 of that. If either the time or the memory ever
-    # bites: emit fewer tokens (whitespace is ~35% of the matches) before
-    # reaching for chunked scanning with a carry buffer.
+    # 5 MB/s on CPython 3.11 (3.7 is noticeably slower), and the tree costs about
+    # 5x the input in RAM. Lexing is ~79% of that time and is already a C-driven
+    # finditer, so there is little left to win in Python -- passing skip_groups
+    # is worth far more than any further tuning, since it leaps over the skipped
+    # bodies in the raw source. Beyond that the honest next step is a native
+    # lexer, not more micro-optimisation.
     opener = gzip.open if path.endswith('.gz') else io.open
     with opener(path, 'rb') as fh:
         raw = fh.read()
