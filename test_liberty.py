@@ -500,6 +500,146 @@ def _summary_text(report):
 
 
 # ==========================================================================
+# Cell comparison within one library
+# ==========================================================================
+
+BUFFERS = os.path.join(HERE, 'sample_buffers.lib')
+
+# sample_buffers.lib plants an exactly linear delay model per cell:
+#   delay = intrinsic + drive_resistance * load
+PLANTED_MODEL = {           # cell: (intrinsic_rise, drive_rise)
+    'BUFx1': (0.020, 4.0),
+    'BUFx2': (0.022, 2.0),
+    'BUFx4_LVT': (0.011, 1.0),
+    'BUFx1_HVT': (0.030, 6.0),
+    'BUFx1_OLD': (0.024, 5.0),
+}
+
+
+def _buffers():
+    return lc.compare_cells(lc.load(BUFFERS), 'BUF*,CLKBUF*')
+
+
+def _by_cell(report):
+    return {s['cell']: s for s in report['cells']}
+
+
+@check
+def lut_eval_interpolates_and_reports_clamping():
+    table = {'indexes': [[0.01, 0.10], [1.0, 2.0]],
+             'values': [[10.0, 20.0], [30.0, 40.0]]}
+    assert lc.lut_eval(table, 0.01, 1.0) == (10.0, False)     # corner
+    assert lc.lut_eval(table, 0.01, 1.5) == (15.0, False)     # along load
+    assert lc.lut_eval(table, 0.055, 1.0) == (20.0, False)    # along slew
+    value, clamped = lc.lut_eval(table, 0.055, 1.5)           # both axes
+    assert abs(value - 25.0) < 1e-12, value
+    assert not clamped
+    value, clamped = lc.lut_eval(table, 0.01, 9.0)            # outside the grid
+    assert (value, clamped) == (20.0, True), (value, clamped)
+
+
+@check
+def delay_model_is_recovered_from_the_luts():
+    """The fitted intrinsic/drive must reproduce the planted linear model."""
+    sigs = _by_cell(_buffers())
+    for cell, (intrinsic, drive) in PLANTED_MODEL.items():
+        s = sigs[cell]
+        assert abs(s['intrinsic_rise'] - intrinsic) < 1e-9, (cell, s['intrinsic_rise'])
+        assert abs(s['drive_rise'] - drive) < 1e-9, (cell, s['drive_rise'])
+
+
+@check
+def cells_are_evaluated_at_one_common_operating_point():
+    """BUFx1 and BUFx2 have different load grids; both must still be comparable."""
+    report = _buffers()
+    sigs = _by_cell(report)
+    load = report['reference']['load']
+    assert load == 0.008, load
+    # BUFx1's grid is 0.001..0.016, BUFx2's is 0.002..0.032 -- no shared point,
+    # so this number only exists because of interpolation.
+    assert abs(sigs['BUFx1']['delay_rise'] - (0.020 + 4.0 * load)) < 1e-9
+    assert abs(sigs['BUFx2']['delay_rise'] - (0.022 + 2.0 * load)) < 1e-9
+    assert not sigs['BUFx1']['clamped'] and not sigs['BUFx2']['clamped']
+
+
+@check
+def fanout_delay_normalises_drive_strength():
+    sigs = _by_cell(_buffers())
+    # FO4 load is 4x the cell's OWN input capacitance
+    assert abs(sigs['BUFx1']['delay_fo4'] - 0.035) < 1e-9, sigs['BUFx1']['delay_fo4']
+    assert abs(sigs['BUFx2']['delay_fo4'] - 0.037) < 1e-9
+    assert abs(sigs['BUFx4_LVT']['delay_fo4'] - 0.0185) < 1e-9
+    assert abs(sigs['BUFx1_HVT']['delay_fo4'] - 0.053) < 1e-9
+
+
+@check
+def ratios_are_against_the_best_cell_per_axis():
+    sigs = _by_cell(_buffers())
+    assert abs(sigs['BUFx1_HVT']['leakage_ratio'] - 1.0) < 1e-9    # lowest leakage
+    assert abs(sigs['BUFx4_LVT']['leakage_ratio'] - 27.0) < 1e-9   # 81 / 3
+    assert abs(sigs['BUFx1']['area_ratio'] - 1.0) < 1e-9           # smallest area
+    assert abs(sigs['CLKBUFx2']['area_ratio'] - 2.0) < 1e-9        # 0.48 / 0.24
+
+
+@check
+def only_genuinely_redundant_cells_are_flagged_dominated():
+    """Regression guard: domination must not be judged on FO-N delay.
+
+    FO-N normalises drive away, so a small cell always looks faster there. An
+    earlier version ranked on it and declared BUFx2 redundant -- which would
+    have told the user to drop a working high-drive buffer.
+    """
+    report = _buffers()
+    dominated = {n['cell'] for n in report['notes'] if 'dominated by' in n['note']}
+    assert dominated == {'BUFx1_OLD'}, dominated
+    assert 'BUFx2' not in dominated, 'high-drive cell wrongly called redundant'
+    assert 'BUFx1_HVT' not in dominated, 'low-leakage cell wrongly called redundant'
+    assert 'BUFx4_LVT' not in dominated, 'fast cell wrongly called redundant'
+
+
+@check
+def vendor_flags_and_clock_cells_are_surfaced():
+    report = _buffers()
+    notes = {(n['cell'], n['note'][:20]) for n in report['notes']}
+    assert ('BUFx2_ECO', 'marked dont_use by t') in notes, notes
+    assert any(c == 'CLKBUFx2' and n.startswith('clock cell') for c, n in notes), notes
+    sigs = _by_cell(report)
+    assert sigs['BUFx2_ECO']['dont_use'] and sigs['CLKBUFx2']['is_clock']
+    assert not sigs['BUFx1']['dont_use']
+
+
+@check
+def mixed_functions_are_reported():
+    """Cells with different functions are not interchangeable; say so."""
+    report = lc.compare_cells(lc.load(SAMPLE), '*')
+    assert len(report['functions']) > 1, report['functions']
+    single = _buffers()
+    assert list(single['functions']) == ['A'], single['functions']
+
+
+@check
+def within_report_html_is_self_contained():
+    page = lc.render_cells_html(_buffers())
+    assert '<!DOCTYPE html>' in page
+    for forbidden in ('http://', 'https://', '<script', 'src='):
+        assert forbidden not in page, forbidden
+    assert 'BUFx1_OLD' in page and 'dominated by' in page
+    assert 'dont_use' in page
+
+
+@check
+def within_cli_runs_end_to_end():
+    import liberty_compare
+    out = io.StringIO()
+    liberty_compare._summarise_cells(_buffers(), out)
+    text = out.getvalue()
+    assert 'BUFx4_LVT' in text and 'driveR' in text
+    assert 'dominated by BUFx1' in text
+    rc = liberty_compare.main([BUFFERS, '--within', 'BUF*'])
+    assert rc == 0, rc
+
+
+# ==========================================================================
 # Definition of Done -- enforced, not just documented
 # ==========================================================================
 

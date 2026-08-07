@@ -419,6 +419,337 @@ def compare_files(paths, tol=1e-9, cells=None, with_timing=True):
 
 
 # --------------------------------------------------------------------------
+# Cell comparison within one library
+# --------------------------------------------------------------------------
+#
+# Different question from the library diff above, so a different method.
+#
+# Two variants of the same buffer have different index_2 (output load) grids,
+# because the grid is scaled to the cell's drive strength. There is no shared
+# point to diff, so elementwise comparison is meaningless here -- the only way
+# to rank them is to evaluate every cell at the SAME operating point, which
+# means interpolating. That is the opposite of the cross-library rule (where
+# interpolating would invent numbers to paper over a real grid mismatch); here
+# interpolation IS the measurement.
+#
+# What actually distinguishes cell variants is a small linear model:
+#
+#     delay(load) = intrinsic + drive_resistance * load
+#
+# Fitted across the load axis at a fixed input slew, that gives the two numbers
+# that explain a family: intrinsic delay and drive resistance. Together with
+# input capacitance, leakage and area, they are the cell's PPA signature.
+
+
+def _interp1(xs, ys, x):
+    # type: (List[float], List[float], float) -> Tuple[float, bool]
+    """Linear interpolation with clamping. Returns (value, was_clamped)."""
+    if not xs:
+        return (float('nan'), True)
+    if len(xs) == 1:
+        return (ys[0], x != xs[0])
+    if x <= xs[0]:
+        return (ys[0], x < xs[0])
+    if x >= xs[-1]:
+        return (ys[-1], x > xs[-1])
+    for i in range(1, len(xs)):
+        if x <= xs[i]:
+            span = xs[i] - xs[i - 1]
+            if span == 0:
+                return (ys[i], False)
+            frac = (x - xs[i - 1]) / span
+            return (ys[i - 1] + frac * (ys[i] - ys[i - 1]), False)
+    return (ys[-1], True)
+
+
+def lut_eval(table, slew, load):
+    # type: (Dict[str, Any], float, float) -> Tuple[float, bool]
+    """Bilinear lookup of a 2-D LUT at (input slew, output load).
+
+    Clamps to the grid edge rather than extrapolating, and reports whether it
+    had to -- a clamped number is still useful for ranking but must not be
+    quoted as if it were characterised data.
+    """
+    indexes, values = table.get('indexes') or [], table.get('values') or []
+    if not values:
+        return (float('nan'), True)
+    if len(indexes) < 2:  # 1-D table: load axis only
+        xs = indexes[0] if indexes else []
+        flat = [v for row in values for v in row]
+        return _interp1(xs, flat, load)
+
+    slews, loads = indexes[0], indexes[1]
+    row_vals = []
+    clamped = False
+    for row in values:
+        value, was = _interp1(loads, row, load)
+        clamped = clamped or was
+        row_vals.append(value)
+    value, was = _interp1(slews, row_vals, slew)
+    return (value, clamped or was)
+
+
+def _linfit(xs, ys):
+    # type: (List[float], List[float]) -> Tuple[float, float]
+    """Least-squares fit y = intercept + slope*x. Slope 0 if degenerate."""
+    n = len(xs)
+    if n < 2:
+        return (ys[0] if ys else float('nan'), 0.0)
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    denom = sum((x - mean_x) ** 2 for x in xs)
+    if denom == 0:
+        return (mean_y, 0.0)
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
+    return (mean_y - slope * mean_x, slope)
+
+
+def _primary_arc(cell):
+    # type: (Dict[str, Any]) -> Optional[Tuple[str, Dict[str, Any]]]
+    """The combinational input-to-output arc that characterises the cell.
+
+    Prefers an unconditional combinational arc on an output pin; falls back to
+    whatever arc carries a cell_rise table so odd cells still rank.
+    """
+    fallback = None
+    for key, arc in sorted(cell['arcs'].items()):
+        if 'cell_rise' not in arc['tables'] and 'cell_fall' not in arc['tables']:
+            continue
+        pin_name = key.split('|')[0]
+        direction = cell['pins'].get(pin_name, {}).get(
+            'attributes', {}).get('direction')
+        if direction != 'output':
+            continue
+        timing_type = arc['attributes'].get('timing_type', 'combinational')
+        when = arc['attributes'].get('when')
+        if timing_type == 'combinational' and not when:
+            return (key, arc)
+        if fallback is None:
+            fallback = (key, arc)
+    return fallback
+
+
+def _input_cap(cell, related_pin):
+    # type: (Dict[str, Any], Optional[str]) -> Optional[float]
+    """Capacitance of the driving input pin, or the largest input pin."""
+    pins = cell['pins']
+    if related_pin and related_pin in pins:
+        cap = _as_float(pins[related_pin]['attributes'].get('capacitance'))
+        if cap is not None:
+            return cap
+    caps = [_as_float(p['attributes'].get('capacitance')) for p in pins.values()
+            if p['attributes'].get('direction') == 'input']
+    caps = [c for c in caps if c is not None]
+    return max(caps) if caps else None
+
+
+def cell_signature(name, cell, slew, load, fanout=4):
+    # type: (str, Dict[str, Any], float, float, int) -> Dict[str, Any]
+    """Area, leakage, capacitance and the fitted delay model for one cell."""
+    attrs = cell['attributes']
+    sig = {
+        'cell': name,
+        'area': _as_float(attrs.get('area')),
+        'leakage': _as_float(attrs.get('cell_leakage_power')),
+        'function': None,
+        'dont_use': attrs.get('dont_use') in ('true', 'True', '1'),
+        'dont_touch': attrs.get('dont_touch') in ('true', 'True', '1'),
+        'is_clock': any(p['attributes'].get('clock') in ('true', 'True')
+                        for p in cell['pins'].values()),
+        'pins': len(cell['pins']),
+        'input_cap': None, 'max_capacitance': None,
+        'arc': None, 'clamped': False,
+        'intrinsic_rise': None, 'drive_rise': None,
+        'intrinsic_fall': None, 'drive_fall': None,
+        'delay_rise': None, 'delay_fall': None,
+        'delay_fo%d' % fanout: None,
+        'transition_rise': None,
+        'leakage_states': cell['leakage_power'] or None,
+    }  # type: Dict[str, Any]
+
+    states = [v for v in (cell['leakage_power'] or {}).values() if v is not None]
+    sig['leakage_max_state'] = max(states) if states else None
+
+    found = _primary_arc(cell)
+    if found is None:
+        return sig
+    key, arc = found
+    sig['arc'] = key
+    pin_name, related = key.split('|')[0], key.split('|')[1]
+    sig['function'] = cell['pins'].get(pin_name, {}).get(
+        'attributes', {}).get('function')
+    sig['max_capacitance'] = _as_float(cell['pins'].get(pin_name, {}).get(
+        'attributes', {}).get('max_capacitance'))
+    sig['input_cap'] = _input_cap(cell, related)
+
+    tables = arc['tables']
+    for edge in ('rise', 'fall'):
+        table = tables.get('cell_%s' % edge)
+        if not table:
+            continue
+        value, clamped = lut_eval(table, slew, load)
+        sig['delay_%s' % edge] = value
+        sig['clamped'] = sig['clamped'] or clamped
+
+        # Fit delay(load) along this cell's own load axis at the reference slew,
+        # so the model uses characterised points rather than clamped ones.
+        indexes = table.get('indexes') or []
+        if len(indexes) >= 2 and indexes[1]:
+            loads = indexes[1]
+            delays = [lut_eval(table, slew, l)[0] for l in loads]
+            intrinsic, drive = _linfit(loads, delays)
+            sig['intrinsic_%s' % edge] = intrinsic
+            sig['drive_%s' % edge] = drive
+
+    trans = tables.get('rise_transition')
+    if trans:
+        sig['transition_rise'] = lut_eval(trans, slew, load)[0]
+
+    # Fanout-of-N: each cell drives N copies of itself. Normalises away drive
+    # strength, which is the standard way to compare cells of different sizes.
+    if sig['input_cap'] is not None:
+        fo_load = fanout * sig['input_cap']
+        rise = tables.get('cell_rise')
+        fall = tables.get('cell_fall')
+        vals = [lut_eval(t, slew, fo_load)[0] for t in (rise, fall) if t]
+        if vals:
+            sig['delay_fo%d' % fanout] = sum(vals) / len(vals)
+    return sig
+
+
+def _reference_point(cells, slew=None, load=None):
+    # type: (Dict[str, Any], Optional[float], Optional[float]) -> Tuple[float, float]
+    """Pick a slew and load that sit inside as many cells' grids as possible.
+
+    Median of the union of the grid points: a single operating point every cell
+    is evaluated at, so the numbers are comparable by construction.
+    """
+    slews, loads = [], []
+    for cell in cells.values():
+        found = _primary_arc(cell)
+        if not found:
+            continue
+        for table in found[1]['tables'].values():
+            indexes = table.get('indexes') or []
+            if indexes:
+                slews.extend(indexes[0])
+            if len(indexes) > 1:
+                loads.extend(indexes[1])
+
+    def median(xs, default):
+        if not xs:
+            return default
+        xs = sorted(xs)
+        return xs[len(xs) // 2]
+
+    return (slew if slew is not None else median(slews, 0.01),
+            load if load is not None else median(loads, 0.005))
+
+
+def compare_cells(lib, pattern='*', slew=None, load=None, fanout=4):
+    # type: (Dict[str, Any], str, Optional[float], Optional[float], int) -> Dict[str, Any]
+    """Rank cells matching `pattern` within one library by their PPA signature."""
+    globs = [p.strip() for p in pattern.split(',') if p.strip()] or ['*']
+    selected = {name: cell for name, cell in lib['cells'].items()
+                if any(fnmatch.fnmatch(name, g) for g in globs)}
+    slew, load = _reference_point(selected, slew, load)
+
+    sigs = [cell_signature(name, cell, slew, load, fanout)
+            for name, cell in sorted(selected.items())]
+
+    # Ratios against the best cell in each dimension: "1.8x the area of the
+    # smallest" is the number that decides whether to drop a cell.
+    fo_key = 'delay_fo%d' % fanout
+    for metric, key in (('area', 'area'), ('leakage', 'leakage'),
+                        ('delay', fo_key), ('input_cap', 'input_cap')):
+        values = [s[key] for s in sigs if s[key] is not None and s[key] > 0]
+        best = min(values) if values else None
+        for s in sigs:
+            s['%s_ratio' % metric] = (
+                s[key] / best if best and s[key] is not None and best > 0 else None)
+
+    # Cells sharing a logic function are the ones actually interchangeable.
+    functions = {}  # type: Dict[str, List[str]]
+    for s in sigs:
+        functions.setdefault(s['function'] or '(none)', []).append(s['cell'])
+
+    notes = _cell_notes(sigs, fo_key)
+    return {
+        'library': lib.get('name'),
+        'file': lib.get('file'),
+        'pattern': pattern,
+        'reference': {'slew': slew, 'load': load, 'fanout': fanout},
+        'functions': functions,
+        'cells': sigs,
+        'notes': notes,
+    }
+
+
+def _cell_notes(sigs, fo_key):
+    # type: (List[Dict[str, Any]], str) -> List[Dict[str, str]]
+    """Flag cells worth a second look. Ranking is the tool's job; the decision
+    to drop a cell stays the user's."""
+    notes = []
+    for s in sigs:
+        if s['dont_use']:
+            notes.append({'cell': s['cell'], 'severity': 'high',
+                          'note': 'marked dont_use by the vendor'})
+        if s['dont_touch'] and not s['dont_use']:
+            notes.append({'cell': s['cell'], 'severity': 'info',
+                          'note': 'marked dont_touch'})
+        if s['is_clock']:
+            notes.append({'cell': s['cell'], 'severity': 'info',
+                          'note': 'clock cell -- not interchangeable with data '
+                                  'buffers even at identical function'})
+        if s['clamped']:
+            notes.append({'cell': s['cell'], 'severity': 'info',
+                          'note': 'operating point outside this cell\'s grid, '
+                                  'value clamped to the edge'})
+    for s in sigs:
+        other = _dominator(s, sigs)
+        if other is not None:
+            notes.append({
+                'cell': s['cell'], 'severity': 'high',
+                'note': 'dominated by %s: same function, and no worse on area, '
+                        'leakage, input capacitance, drive strength or maximum '
+                        'load' % other['cell']})
+    return notes
+
+
+def _dominator(sig, sigs):
+    # type: (Dict[str, Any], List[Dict[str, Any]]) -> Optional[Dict[str, Any]]
+    """A cell of the same function that is no worse on every axis, and better
+    on at least one.
+
+    Deliberately NOT based on FO-N delay. FO-N normalises drive strength away,
+    so a small cell always looks faster there, and ranking on it would declare
+    every high-drive buffer redundant -- exactly the wrong advice. A stronger
+    cell earns its area and leakage by having lower drive resistance and a
+    higher max_capacitance, so those are the axes that decide domination.
+    """
+    if sig['is_clock'] or sig['function'] is None:
+        return None
+    axes = ('area', 'leakage', 'input_cap', 'drive_rise')  # lower is better
+    for other in sigs:
+        if other['cell'] == sig['cell'] or other['function'] != sig['function']:
+            continue
+        if other['dont_use'] or other['is_clock']:
+            continue
+        if any(other[a] is None or sig[a] is None for a in axes):
+            continue
+        if any(other[a] > sig[a] for a in axes):
+            continue
+        # and it must be able to drive at least as much load
+        if (other['max_capacitance'] is not None
+                and sig['max_capacitance'] is not None
+                and other['max_capacitance'] < sig['max_capacitance']):
+            continue
+        if any(other[a] < sig[a] for a in axes):  # strictly better somewhere
+            return other
+    return None
+
+
+# --------------------------------------------------------------------------
 # HTML report
 # --------------------------------------------------------------------------
 
@@ -603,6 +934,98 @@ def _render_comparison(cmp_):
     return ''.join(out)
 
 
+def _render_cells(report):
+    # type: (Dict[str, Any]) -> str
+    ref = report['reference']
+    fo = 'delay_fo%d' % ref['fanout']
+    out = ['<h1>Cell comparison: %s</h1>' % _e(report['pattern']),
+           '<p class="sub">%s &nbsp; <code>%s</code></p>'
+           % (_e(report['library']), _e(report['file'])),
+           '<p>Every cell evaluated at the same operating point: input slew '
+           '<strong>%s</strong>, output load <strong>%s</strong>, interpolated '
+           'onto each cell\'s own grid. FO%d drives %d copies of the cell '
+           'itself.</p>' % (_fmt(ref['slew']), _fmt(ref['load']),
+                            ref['fanout'], ref['fanout'])]
+
+    if len(report['functions']) > 1:
+        items = ' '.join(
+            '<span class="pill">%s: %s</span>' % (_e(fn), _e(', '.join(cells)))
+            for fn, cells in sorted(report['functions'].items()))
+        out.append('<div class="warn"><strong>These cells do not all implement '
+                   'the same function</strong>, so they are not all '
+                   'interchangeable.<p>%s</p></div>' % items)
+
+    high = [n for n in report['notes'] if n['severity'] == 'high']
+    info = [n for n in report['notes'] if n['severity'] != 'high']
+    if high:
+        out.append('<h2>Worth a second look</h2><ul>%s</ul>' % ''.join(
+            '<li><strong>%s</strong> — %s</li>' % (_e(n['cell']), _e(n['note']))
+            for n in high))
+
+    out.append('<h2>PPA signature</h2>')
+    headers = ['cell', 'function', 'area', 'x', 'leakage', 'x', 'Cin', 'x',
+               'FO%d delay' % ref['fanout'], 'x', 'intrinsic', 'drive R',
+               'max cap', 'flags']
+    rows = []
+    for s in sorted(report['cells'],
+                    key=lambda c: (c[fo] is None, c[fo] or 0.0)):
+        flags = []
+        if s['dont_use']:
+            flags.append('dont_use')
+        if s['dont_touch']:
+            flags.append('dont_touch')
+        if s['is_clock']:
+            flags.append('clock')
+        if s['clamped']:
+            flags.append('clamped')
+        rows.append(
+            '<td>%s</td><td>%s</td>'
+            '<td class="num">%s</td>%s'
+            '<td class="num">%s</td>%s'
+            '<td class="num">%s</td>%s'
+            '<td class="num">%s</td>%s'
+            '<td class="num">%s</td><td class="num">%s</td>'
+            '<td class="num">%s</td><td>%s</td>' % (
+                _e(s['cell']), _e(s['function']),
+                _fmt(s['area'], 4), _ratio_cell(s['area_ratio']),
+                _fmt(s['leakage'], 4), _ratio_cell(s['leakage_ratio']),
+                _fmt(s['input_cap'], 4), _ratio_cell(s['input_cap_ratio']),
+                _fmt(s[fo], 4), _ratio_cell(s['delay_ratio']),
+                _fmt(s['intrinsic_rise'], 4), _fmt(s['drive_rise'], 4),
+                _fmt(s['max_capacitance'], 4),
+                _e(' '.join(flags))))
+    out.append(_table_html(headers, rows))
+    out.append('<p class="sub">Columns marked <em>x</em> are ratios against the '
+               'best cell in that column. <code>intrinsic</code> and '
+               '<code>drive R</code> are the fitted terms of '
+               '<code>delay = intrinsic + R &times; load</code>: intrinsic is '
+               'the unloaded delay, R falls as drive strength rises.</p>')
+
+    if info:
+        out.append('<h2>Notes</h2><ul>%s</ul>' % ''.join(
+            '<li><strong>%s</strong> — %s</li>' % (_e(n['cell']), _e(n['note']))
+            for n in info))
+    return ''.join(out)
+
+
+def _ratio_cell(ratio):
+    # type: (Optional[float]) -> str
+    if ratio is None:
+        return '<td class="num flat">-</td>'
+    cls = 'flat' if ratio <= 1.0001 else ('up' if ratio >= 1.5 else '')
+    return '<td class="num %s">%.2fx</td>' % (cls, ratio)
+
+
+def render_cells_html(report):
+    # type: (Dict[str, Any]) -> str
+    """Self-contained HTML for a within-library cell comparison."""
+    return ('<!DOCTYPE html>\n<html><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>Cell comparison: %s</title><style>%s</style></head>'
+            '<body>%s</body></html>\n'
+            % (_e(report['pattern']), _CSS, _render_cells(report)))
+
+
 def render_html(report):
     # type: (Dict[str, Any]) -> str
     """Self-contained HTML: inline CSS, no external assets, no JavaScript."""
@@ -651,6 +1074,53 @@ def _summarise(report, stream=sys.stdout):
                 '-' if d['pct'] is None else '%+.2f%%' % d['pct']), file=stream)
 
 
+def _summarise_cells(report, stream=sys.stdout):
+    # type: (Dict[str, Any], Any) -> None
+    ref = report['reference']
+    fo = 'delay_fo%d' % ref['fanout']
+    print('%s  cells matching %s' % (report['library'], report['pattern']),
+          file=stream)
+    print('  operating point: slew=%s load=%s (interpolated onto each cell\'s grid)'
+          % (_fmt(ref['slew']), _fmt(ref['load'])), file=stream)
+    if len(report['functions']) > 1:
+        print('  !! mixed functions, not all interchangeable: %s'
+              % ', '.join(sorted(report['functions'])), file=stream)
+    print('  %-16s %-9s %8s %8s %9s %10s %9s  %s'
+          % ('cell', 'function', 'area', 'leakage', 'Cin',
+             'FO%d' % ref['fanout'], 'driveR', 'flags'), file=stream)
+    for s in sorted(report['cells'], key=lambda c: (c[fo] is None, c[fo] or 0.0)):
+        flags = ' '.join(f for f, on in (
+            ('dont_use', s['dont_use']), ('dont_touch', s['dont_touch']),
+            ('clock', s['is_clock']), ('clamped', s['clamped'])) if on)
+        print('  %-16s %-9s %8s %8s %9s %10s %9s  %s'
+              % (s['cell'][:16], (s['function'] or '-')[:9],
+                 _fmt(s['area'], 4), _fmt(s['leakage'], 4),
+                 _fmt(s['input_cap'], 3), _fmt(s[fo], 4),
+                 _fmt(s['drive_rise'], 3), flags), file=stream)
+    for note in report['notes']:
+        if note['severity'] == 'high':
+            print('  ** %s: %s' % (note['cell'], note['note']), file=stream)
+
+
+def _main_within(args, ap):
+    # type: (Any, Any) -> int
+    if len(args.libfiles) != 1:
+        ap.error('--within compares cells inside ONE library; give a single file')
+    lib = load(args.libfiles[0])
+    report = compare_cells(lib, args.within, args.slew, args.load, args.fanout)
+    _summarise_cells(report)
+    if args.json:
+        with io.open(args.json, 'w', encoding='utf-8') as fh:
+            fh.write(json.dumps(report, indent=2, ensure_ascii=False,
+                                sort_keys=True))
+        print('wrote %s' % args.json)
+    if args.html:
+        with io.open(args.html, 'w', encoding='utf-8') as fh:
+            fh.write(render_cells_html(report))
+        print('wrote %s' % args.html)
+    return 0
+
+
 def main(argv=None):
     # type: (Optional[List[str]]) -> int
     import argparse
@@ -665,10 +1135,26 @@ def main(argv=None):
                     help='comma-separated cell name globs, e.g. "INV*,BUF*"')
     ap.add_argument('--no-timing', action='store_true',
                     help='skip timing/power tables (much faster and smaller)')
+    ap.add_argument('--within', metavar='GLOBS',
+                    help='compare cells against each other inside ONE library, '
+                         'e.g. --within "BUF*". Ranks them by area, leakage, '
+                         'input capacitance and interpolated delay.')
+    ap.add_argument('--slew', type=float,
+                    help='--within: input slew for the common operating point '
+                         '(default: median of the cells\' own grids)')
+    ap.add_argument('--load', type=float,
+                    help='--within: output load for the common operating point '
+                         '(default: median of the cells\' own grids)')
+    ap.add_argument('--fanout', type=int, default=4,
+                    help='--within: fanout for the FO-N delay column (default 4)')
     args = ap.parse_args(argv)
 
+    if args.within:
+        return _main_within(args, ap)
+
     if len(args.libfiles) < 2:
-        ap.error('need at least two libraries to compare')
+        ap.error('need at least two libraries to compare, or --within GLOBS to '
+                 'compare cells inside one library')
 
     cells = [c.strip() for c in args.cells.split(',') if c.strip()] or None
     report = compare_files(args.libfiles, tol=args.tol, cells=cells,

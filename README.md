@@ -41,11 +41,60 @@ python3.7 liberty_parser.py my.lib --show cell:INVx1       # pretty-print one su
 python3.7 liberty_parser.py my.lib --json tree.json        # whole tree as JSON
 python3.7 liberty_parser.py huge.lib --stats --skip-groups ccs   # drop CCS current vectors
 
-# compare (first file is the reference)
+# compare libraries (first file is the reference)
 python3.7 liberty_compare.py ref.lib new.lib --html report.html --json diff.json
 python3.7 liberty_compare.py ss.lib tt.lib ff.lib --html corners.html
 python3.7 liberty_compare.py a.lib b.lib --cells "INV*,BUF*" --no-timing
+
+# compare cells against each other INSIDE one library
+python3.7 liberty_compare.py my.lib --within "BUF*" --html buffers.html
+python3.7 liberty_compare.py my.lib --within "BUF*,CLKBUF*" --slew 0.02 --load 0.01
 ```
+
+## Comparing cell variants within one library
+
+`--within GLOBS` answers "what actually differs between these cells, and should
+I avoid any of them" when the vendor documents nothing.
+
+```
+cell             function      area  leakage       Cin        FO4    driveR  flags
+BUFx4_LVT        A             0.42       81     0.002     0.0185         1
+BUFx1            A             0.24        9     0.001      0.035         4
+BUFx2            A             0.42       19     0.002      0.037         2
+BUFx2_ECO        A             0.42       19     0.002      0.037         2  dont_use
+BUFx1_OLD        A             0.26       11     0.001      0.043         5
+BUFx1_HVT        A             0.24        3     0.001      0.053         6
+** BUFx2_ECO: marked dont_use by the vendor
+** BUFx1_OLD: dominated by BUFx1: same function, and no worse on area,
+   leakage, input capacitance, drive strength or maximum load
+```
+
+Two variants of the same buffer have **different load grids**, scaled to their
+drive strength, so there is no shared LUT point to compare. Every cell is
+therefore evaluated at one common operating point, interpolated onto its own
+grid — the opposite of the cross-library rule, where interpolating would paper
+over a real mismatch. Here interpolation is the measurement.
+
+The delay LUT is fitted to `delay = intrinsic + drive_resistance × load` along
+the load axis. Those two numbers are what actually separate a cell family:
+
+- **intrinsic** — unloaded delay
+- **drive R** — falls as drive strength rises; the real meaning of the `x1`/`x2`/`x4` suffix
+- **Cin** — the load this cell presents to whatever drives it
+- **FO4** — delay driving 4 copies of itself, which normalises drive strength away
+
+Reference slew and load default to the median of the cells' own grids; override
+with `--slew` / `--load`, and change the fanout with `--fanout`. Values that fall
+outside a cell's characterised grid are clamped to the edge and flagged
+`clamped` — still fine for ranking, not to be quoted as characterised data.
+
+**On the `dominated by` flag:** a cell is only called redundant if another cell
+with the same function is no worse on area, leakage, input capacitance, drive
+resistance *and* maximum load. Deliberately not judged on FO-N delay — FO-N
+normalises drive away, so a small cell always looks faster there, and ranking on
+it would declare every high-drive buffer redundant. Above, `BUFx2`, `BUFx4_LVT`
+and `BUFx1_HVT` are all genuine trade-offs and are correctly left alone; only
+`BUFx1_OLD`, which is worse on every axis, is flagged.
 
 ```python
 from liberty_parser import parse_file, CCS_GROUPS
