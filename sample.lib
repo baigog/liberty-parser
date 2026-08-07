@@ -1,0 +1,330 @@
+/*
+ * Adversarial Liberty fixture.
+ * This comment contains braces { } and a semicolon ; and a quote " on purpose.
+ * A naive brace-counting parser dies right here.
+ */
+library (sample_lib_ss_0p75v_125c) {
+
+  technology (cmos);
+  delay_model : table_lookup;
+  revision : 1.0 ;
+
+  /* --- units -------------------------------------------------------- */
+  time_unit                     : "1ns";
+  voltage_unit                  : "1V";
+  current_unit                  : "1mA";
+  pulling_resistance_unit       : "1kohm";
+  leakage_power_unit            : "1nW";
+  capacitive_load_unit          (1, pf);
+
+  nom_process     : 1.0;
+  nom_temperature : 125.0;
+  nom_voltage     : 0.75;
+
+  slew_lower_threshold_pct_rise : 30.0;
+  slew_upper_threshold_pct_rise : 70.0;
+  slew_lower_threshold_pct_fall : 30.0;
+  slew_upper_threshold_pct_fall : 70.0;
+  input_threshold_pct_rise      : 50.0;
+  output_threshold_pct_rise     : 50.0;
+
+  // Non-standard single-line comment. Vendors emit these anyway.
+  default_max_transition : 1.5;
+  default_cell_leakage_power : 0.0
+
+  /* attribute above has NO trailing semicolon - legal in the wild */
+
+  define (custom_vendor_attr, cell, string);
+  define_group (vendor_block, cell);
+
+  voltage_map (VDD, 0.75);
+  voltage_map (VSS, 0.0);
+
+  operating_conditions (ss_0p75v_125c) {
+    process     : 1.0;
+    temperature : 125.0;
+    voltage     : 0.75;
+    tree_type   : balanced_tree;
+  }
+  default_operating_conditions : ss_0p75v_125c;
+
+  lu_table_template (delay_template_3x3) {
+    variable_1 : input_net_transition;
+    variable_2 : total_output_net_capacitance;
+    index_1 ("0.01, 0.10, 1.00");
+    index_2 ("0.50, 1.50, 4.00");
+  }
+
+  power_lut_template (energy_template_2x2) {
+    variable_1 : input_transition_time;
+    variable_2 : total_output_net_capacitance;
+    index_1 ("0.01, 1.00");
+    index_2 ("0.50, 4.00");
+  }
+
+  output_current_template (ccs_template_3x3x5) {
+    variable_1 : input_net_transition;
+    variable_2 : total_output_net_capacitance;
+    variable_3 : time;
+    index_1 ("0.01, 0.10, 1.00");
+    index_2 ("0.50, 1.50, 4.00");
+  }
+
+  /* ==================================================================
+   * Cell 1: inverter. Exercises timing, LVF, CCS, pg_pin, internal_power.
+   * ================================================================== */
+  cell (INVx1_ASAP7) {
+    area : 0.532;
+    cell_leakage_power : 12.4;
+    custom_vendor_attr : "unknown to any schema, must survive; keep {me}";
+
+    pg_pin (VDD) {
+      pg_type : primary_power;
+      voltage_name : VDD;
+    }
+    pg_pin (VSS) {
+      pg_type : primary_ground;
+      voltage_name : VSS;
+    }
+
+    /* two when-qualified leakage groups - duplicate group type, both must survive */
+    leakage_power () {
+      when : "A";
+      value : 15.1;
+    }
+    leakage_power () {
+      when : "!A";
+      value : 9.7;
+    }
+
+    pin (A) {
+      direction : input;
+      capacitance : 0.00121;
+      rise_capacitance : 0.00119;
+      fall_capacitance : 0.00123;
+      max_transition : 1.5;
+    }
+
+    pin (Y) {
+      direction : output;
+      function : "!A";
+      max_capacitance : 4.0;
+      max_transition : 1.5;
+
+      internal_power () {
+        related_pin : "A";
+        rise_power (energy_template_2x2) {
+          index_1 ("0.01, 1.00");
+          index_2 ("0.50, 4.00");
+          values ("0.0011, 0.0019", \
+                  "0.0014, 0.0025");
+        }
+        fall_power (energy_template_2x2) {
+          index_1 ("0.01, 1.00");
+          index_2 ("0.50, 4.00");
+          values ("0.0010, 0.0018", \
+                  "0.0013, 0.0024");
+        }
+      }
+
+      /* first timing arc */
+      timing () {
+        related_pin : "A";
+        timing_sense : negative_unate;
+        timing_type : combinational;
+
+        cell_rise (delay_template_3x3) {
+          index_1 ("0.01, 0.10, 1.00");
+          index_2 ("0.50, 1.50, 4.00");
+          values ( \
+            "0.0121, 0.0245, 0.0611", \
+            "0.0158, 0.0283, 0.0650", \
+            "0.0402, 0.0530, 0.0901"  \
+          );
+        }
+        cell_fall (delay_template_3x3) {
+          index_1 ("0.01, 0.10, 1.00");
+          index_2 ("0.50, 1.50, 4.00");
+          values ( \
+            "0.0110, 0.0230, 0.0590", \
+            "0.0145, 0.0268, 0.0628", \
+            "0.0388, 0.0512, 0.0875"  \
+          );
+        }
+        rise_transition (delay_template_3x3) {
+          index_1 ("0.01, 0.10, 1.00");
+          index_2 ("0.50, 1.50, 4.00");
+          values ( \
+            "0.0090, 0.0210, 0.0700", \
+            "0.0102, 0.0225, 0.0721", \
+            "0.0301, 0.0430, 0.0930"  \
+          );
+        }
+        fall_transition (delay_template_3x3) {
+          index_1 ("0.01, 0.10, 1.00");
+          index_2 ("0.50, 1.50, 4.00");
+          values ( \
+            "0.0085, 0.0200, 0.0680", \
+            "0.0097, 0.0215, 0.0700", \
+            "0.0290, 0.0415, 0.0910"  \
+          );
+        }
+
+        /* LVF / OCV sigma tables - no parser code may name these specifically */
+        ocv_sigma_cell_rise (delay_template_3x3) {
+          sigma_type : early_and_late;
+          index_1 ("0.01, 0.10, 1.00");
+          index_2 ("0.50, 1.50, 4.00");
+          values ( \
+            "0.00041, 0.00062, 0.00131", \
+            "0.00048, 0.00071, 0.00148", \
+            "0.00092, 0.00119, 0.00201"  \
+          );
+        }
+        ocv_sigma_cell_fall (delay_template_3x3) {
+          sigma_type : early_and_late;
+          index_1 ("0.01, 0.10, 1.00");
+          index_2 ("0.50, 1.50, 4.00");
+          values ( \
+            "0.00039, 0.00059, 0.00126", \
+            "0.00045, 0.00068, 0.00142", \
+            "0.00088, 0.00114, 0.00194"  \
+          );
+        }
+
+        /* CCS current vectors - the bulk of a real advanced-node lib.
+           Target of the skip_groups knob. */
+        output_current_rise () {
+          vector (ccs_template_3x3x5) {
+            reference_time : 0.0051;
+            index_1 ("0.01");
+            index_2 ("0.50");
+            index_3 ("0.001, 0.002, 0.003, 0.004, 0.005");
+            values ("0.0001, 0.0009, 0.0021, 0.0011, 0.0002");
+          }
+          vector (ccs_template_3x3x5) {
+            reference_time : 0.0062;
+            index_1 ("0.10");
+            index_2 ("1.50");
+            index_3 ("0.001, 0.002, 0.003, 0.004, 0.005");
+            values ("0.0002, 0.0012, 0.0028, 0.0015, 0.0003");
+          }
+        }
+        output_current_fall () {
+          vector (ccs_template_3x3x5) {
+            reference_time : 0.0049;
+            index_1 ("0.01");
+            index_2 ("0.50");
+            index_3 ("0.001, 0.002, 0.003, 0.004, 0.005");
+            values ("-0.0001, -0.0009, -0.0020, -0.0010, -0.0002");
+          }
+        }
+      }
+    }
+  }
+
+  /* ==================================================================
+   * Cell 2: flip-flop. Exercises ff group, setup/hold constraint arcs,
+   * a bus pin, and a group with multiple args.
+   * ================================================================== */
+  cell (DFFx1_ASAP7) {
+    area : 2.128;
+    cell_leakage_power : 41.9;
+    dont_use : false;
+
+    ff (IQ, IQN) {
+      next_state : "D";
+      clocked_on : "CLK";
+    }
+
+    pin (CLK) {
+      direction : input;
+      clock : true;
+      capacitance : 0.00204;
+      min_pulse_width_high : 0.021;
+      min_pulse_width_low  : 0.019;
+    }
+
+    pin (D) {
+      direction : input;
+      capacitance : 0.00151;
+
+      timing () {
+        related_pin : "CLK";
+        timing_type : setup_rising;
+        rise_constraint (delay_template_3x3) {
+          index_1 ("0.01, 0.10, 1.00");
+          index_2 ("0.01, 0.10, 1.00");
+          values ( \
+            "0.0210, 0.0225, 0.0410", \
+            "0.0222, 0.0238, 0.0428", \
+            "0.0451, 0.0470, 0.0680"  \
+          );
+        }
+        fall_constraint (delay_template_3x3) {
+          index_1 ("0.01, 0.10, 1.00");
+          index_2 ("0.01, 0.10, 1.00");
+          values ( \
+            "0.0201, 0.0216, 0.0398", \
+            "0.0213, 0.0229, 0.0415", \
+            "0.0438, 0.0457, 0.0661"  \
+          );
+        }
+      }
+      timing () {
+        related_pin : "CLK";
+        timing_type : hold_rising;
+        rise_constraint (delay_template_3x3) {
+          index_1 ("0.01, 0.10, 1.00");
+          index_2 ("0.01, 0.10, 1.00");
+          values ( \
+            "-0.0050, -0.0044, 0.0021", \
+            "-0.0041, -0.0035, 0.0030", \
+            "0.0080,  0.0091,  0.0155"  \
+          );
+        }
+      }
+    }
+
+    pin (Q) {
+      direction : output;
+      function : "IQ";
+      max_capacitance : 4.0;
+      timing () {
+        related_pin : "CLK";
+        timing_type : rising_edge;
+        timing_sense : non_unate;
+        cell_rise (delay_template_3x3) {
+          index_1 ("0.01, 0.10, 1.00");
+          index_2 ("0.50, 1.50, 4.00");
+          values ( \
+            "0.0450, 0.0620, 0.1180", \
+            "0.0478, 0.0651, 0.1215", \
+            "0.0712, 0.0895, 0.1470"  \
+          );
+        }
+      }
+    }
+
+    bus (DOUT) {
+      bus_type : bus4;
+      direction : output;
+      pin (DOUT[0]) {
+        direction : output;
+        max_capacitance : 4.0;
+      }
+    }
+
+    vendor_block () {
+      note : "empty parens group, and a string with , : ; { } inside";
+    }
+  }
+
+  type (bus4) {
+    base_type : array;
+    data_type : bit;
+    bit_width : 4;
+    bit_from  : 3;
+    bit_to    : 0;
+  }
+}
