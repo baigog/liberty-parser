@@ -73,6 +73,24 @@ Values stay raw strings — nothing is coerced to float until units are known.
   advanced-node file and are never compared numerically here). `liberty_parser` keeps them
   unless you pass `--skip-groups`.
 
+## Performance
+
+Measured on CPython 3.11; 3.7 is noticeably slower.
+
+| | throughput |
+|---|---|
+| parse into tree | ~5 MB/s |
+| parse with `--skip-groups ccs` on a CCS-heavy library | ~15 MB/s |
+| raw body skip (scanning only) | ~48 MB/s |
+
+Lexing is ~79% of parse time and already runs as a C-driven `finditer`, so
+there is little left to win in Python. The tree costs about 5x the input in RAM.
+
+**`--skip-groups ccs` is worth more than any other tuning.** CCS current vectors
+are typically most of an advanced-node library, and skipped bodies are jumped in
+the raw source rather than tokenized — measured at 4x end-to-end on a file that
+is 72% CCS. Use it whenever you do not need the current vectors.
+
 ## Verifying on a real library
 
 The parser has been checked against the fixture; the real proof is your own library.

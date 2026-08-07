@@ -17,8 +17,8 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from liberty_parser import (CCS_GROUPS, Group, LibertySyntaxError, parse_file,
-                            parse_string, tokenize)
+from liberty_parser import (CCS_GROUPS, Group, LibertySyntaxError, locate,
+                            parse_file, parse_string, tokenize)
 
 SAMPLE = os.path.join(HERE, 'sample.lib')
 SAMPLE_B = os.path.join(HERE, 'sample_b.lib')
@@ -54,10 +54,11 @@ def tokenizer_keeps_delimiters_inside_strings():
 
 
 @check
-def tokenizer_reports_line_numbers():
-    text = 'a : 1;\nb : 2;\nc : 3;\n'
-    lines = {t[1]: t[2] for t in tokenize(text) if t[0] == 'word' and t[1] in 'abc'}
-    assert lines == {'a': 1, 'b': 2, 'c': 3}, lines
+def offsets_resolve_to_line_and_column():
+    text = 'a : 1;\n  b : 2;\nc : 3;\n'
+    lines = {t[1]: locate(text, t[2])
+             for t in tokenize(text) if t[0] == 'word' and t[1] in 'abc'}
+    assert lines == {'a': (1, 1), 'b': (2, 3), 'c': (3, 1)}, lines
 
 
 @check
